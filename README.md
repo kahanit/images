@@ -1,7 +1,8 @@
 # kahanit/images
 
-Container images for the `kahanit/redis-cluster` Helm chart, built from
-Bitnami's Dockerfiles and pushed to Docker Hub under `kahanit/`.
+Container images for the `kahanit/redis-cluster` Helm chart (its source:
+[kahanit/charts](https://github.com/kahanit/charts)), built from Bitnami's
+Dockerfiles and pushed to Docker Hub under `kahanit/`.
 
 | Folder | Upstream folder in `bitnami/containers` | Image |
 |---|---|---|
@@ -17,22 +18,59 @@ in `prebuildfs/opt/bitnami/checksums/`.
 
 ## Building
 
-`.github/workflows/build.yml` builds the three images for `linux/amd64` and
-pushes them on every push to `main` and on manual dispatch. It needs two
-repository secrets:
+`.github/workflows/build.yml` builds the three images for `linux/amd64`,
+scans them and pushes them:
 
-- `DOCKERHUB_USERNAME` — the Docker Hub account that owns the `kahanit` namespace
-- `DOCKERHUB_TOKEN` — a Docker Hub access token with read/write permission
+- every Monday at 02:00 UTC, from the same sources: the Dockerfiles run
+  `apt-get upgrade`, so a weekly rebuild carries Debian's package fixes
+- on a push to `main` that touches an image folder
+- by hand: Actions → Build and push → Run workflow
 
-## Updating an image
+Each build pushes two tags, taken from the Dockerfile (`APP_VERSION`,
+`IMAGE_REVISION`):
 
-1. Copy the upstream folder over the local one, for example
-   `bitnami/redis-cluster/8.10/debian-12` → `redis-cluster/`, and drop
-   `docker-compose.yml`.
-2. Update `UPSTREAM_COMMIT` and the `tag` for that image in the workflow matrix
-   (`<redis version>-r<n>` for `redis-cluster`, the tool version for the others).
-3. Push to `main`; the workflow builds and pushes.
-4. Set the new tag in the cluster's `values/redis.yaml`.
+| Tag | Example | Behaviour |
+|---|---|---|
+| dated | `8.10.3-r1-20261116` | never moved; pin this one in an installation |
+| plain | `8.10.3-r1` | moved to the newest build |
 
-Planned (not yet here): a weekly scheduled rebuild on the newest upstream
-folders, a Trivy scan that fails on critical findings, and an alert on failure.
+A build is not pushed when [Trivy](https://trivy.dev) finds a critical
+vulnerability that has a fix. Vulnerabilities without a fix are listed in
+the run's log and do not block.
+
+## Following upstream
+
+`.github/workflows/upstream.yml` runs every Monday at 01:00 UTC
+(`.github/scripts/sync-upstream.sh`):
+
+- When Bitnami has released newer sources (for Redis: the highest `8.x`
+  branch), it opens the pull request `upstream-sync` with the changed
+  folders. Read the Dockerfile diff and merge; the merge builds and pushes.
+  Then set the new dated tags in the cluster's `values/redis.yaml`.
+- When an upstream folder has had no release for more than 60 days, or is
+  gone, the workflow fails. Bitnami already stopped publishing its
+  `redis-cluster` image on Docker Hub; if the sources stop too, the images
+  have to be built another way (for example on the official `redis` image).
+
+## Setup
+
+Repository secrets (Settings → Secrets and variables → Actions):
+
+- `DOCKERHUB_USERNAME`: the Docker Hub account that owns the `kahanit` namespace
+- `DOCKERHUB_TOKEN`: a Docker Hub access token with read/write permission
+- `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`: where a failed build or upstream
+  check is reported. Without them a failure only shows in GitHub.
+
+Repository setting (Settings → Actions → General → Workflow permissions):
+"Allow GitHub Actions to create and approve pull requests" must be on for
+the upstream pull request.
+
+GitHub switches off scheduled workflows in a public repository after 60 days
+without a commit, and sends an e-mail first. Re-enable them under Actions if
+that happens; a merged upstream pull request resets the clock.
+
+## Updating an image by hand
+
+Run `.github/scripts/sync-upstream.sh` in a clone: it copies the upstream
+`Dockerfile`, `prebuildfs/` and `rootfs/` over each folder and updates
+`UPSTREAM_COMMIT`. Commit, push to `main`, and the workflow builds.

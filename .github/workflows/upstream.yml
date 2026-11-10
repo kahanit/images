@@ -1,0 +1,97 @@
+name: Upstream check
+
+# Looks at github.com/bitnami/containers once a week.
+# - A newer upstream folder (a new Redis, exporter or os-shell release)
+#   becomes a pull request here. Nothing is built until it is merged:
+#   the merge to main starts "Build and push".
+# - An upstream folder with no release for more than 60 days, or one that
+#   is gone, fails this workflow, which sends the Telegram message.
+on:
+  schedule:
+    - cron: "0 1 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: upstream
+  cancel-in-progress: false
+
+env:
+  MAX_QUIET_DAYS: "60"
+  BRANCH: upstream-sync
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Copy the newest upstream folders
+        id: sync
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: .github/scripts/sync-upstream.sh "$MAX_QUIET_DAYS" | tee sync.log
+
+      # One pull request, kept up to date: a second upstream release before
+      # the first is merged replaces the branch's single commit.
+      - name: Open or update the pull request
+        if: steps.sync.outputs.changed == '1'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          {
+            echo "Newer sources from \`bitnami/containers\` at commit \`$(cat UPSTREAM_COMMIT)\`."
+            echo
+            echo '```'
+            cat sync.log
+            echo '```'
+            echo
+            echo "Read the diff of each \`Dockerfile\` before merging: the merge to \`main\` builds, scans and pushes the images."
+            echo "After the build, set the new tags in the installation's values."
+          } > body.md
+          rm sync.log
+          title="Upstream update: $(grep -h -oP 'APP_VERSION="\K[^"]+' redis-cluster/Dockerfile) / $(grep -h -oP 'APP_VERSION="\K[^"]+' redis-exporter/Dockerfile) / $(grep -h -oP 'APP_VERSION="\K[^"]+' os-shell/Dockerfile)"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git switch -C "$BRANCH"
+          git add redis-cluster redis-exporter os-shell UPSTREAM_COMMIT
+          git commit -q -m "$title"
+          git push -q --force origin "$BRANCH"
+          if [ -n "$(gh pr list --head "$BRANCH" --state open --json number --jq '.[].number')" ]; then
+            gh pr edit "$BRANCH" --title "$title" --body-file body.md
+          else
+            gh pr create --base main --head "$BRANCH" --title "$title" --body-file body.md
+          fi
+
+      - name: Fail when upstream has gone quiet
+        if: steps.sync.outputs.quiet != ''
+        env:
+          QUIET: ${{ steps.sync.outputs.quiet }}
+        run: |
+          echo "::error::No upstream release for more than $MAX_QUIET_DAYS days (or the folder is gone): $QUIET"
+          exit 1
+
+  notify:
+    needs: check
+    if: failure()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Telegram
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          if [ -z "$TELEGRAM_BOT_TOKEN" ] || [ -z "$TELEGRAM_CHAT_ID" ]; then
+            echo "::warning::TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID are not set; no message sent"
+            exit 0
+          fi
+          curl -sS --fail-with-body -o /dev/null \
+            "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
+            --data-urlencode "text=kahanit/images: the upstream check failed (Bitnami's sources went quiet or changed shape). ${RUN_URL}"
