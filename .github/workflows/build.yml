@@ -27,6 +27,12 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-latest
+    # A registry that exists only for the length of the job.
+    services:
+      registry:
+        image: registry:2.8.3
+        ports:
+          - 5000:5000
     strategy:
       fail-fast: false
       matrix:
@@ -69,12 +75,14 @@ jobs:
           } >> "$GITHUB_OUTPUT"
           echo "### $IMAGE: \`$repo:$dated\` and \`$repo:$tag\`" >> "$GITHUB_STEP_SUMMARY"
 
+      # The runner's buildx can reach the job's own registry on localhost.
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+        with:
+          driver-opts: network=host
 
-      # Built into a file first; nothing is pushed until the scan has
+      # Built and pushed to the registry that lives only inside this job
+      # (services: below); Docker Hub gets nothing until the scan has
       # passed. No cache: every run installs today's packages.
-      # (Trivy 0.76.1 cannot read an image out of the runner's Docker:
-      # "failed to extract the archive". It reads the file.)
       - name: Build
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
@@ -82,19 +90,23 @@ jobs:
           platforms: linux/amd64
           pull: true
           no-cache: true
-          outputs: type=docker,dest=${{ runner.temp }}/image.tar
+          push: true
           provenance: false
-          tags: |
-            ${{ steps.tags.outputs.repo }}:${{ steps.tags.outputs.dated }}
-            ${{ steps.tags.outputs.repo }}:${{ steps.tags.outputs.tag }}
+          tags: localhost:5000/${{ matrix.image }}:scan
 
+      # Trivy reads the image from that registry. (Reading it out of the
+      # runner's Docker or from a saved file failed with "failed to extract
+      # the archive", Trivy 0.76.1, 2026-11-10.)
       # Fails the job on a critical vulnerability that has a fix. Ones
       # without a fix are listed by the next step but do not block.
       - name: Scan (blocking)
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        env:
+          TRIVY_NON_SSL: "true"
+          TRIVY_IMAGE_SRC: remote
         with:
           version: v0.76.1
-          input: ${{ runner.temp }}/image.tar
+          image-ref: localhost:5000/${{ matrix.image }}:scan
           scanners: vuln
           severity: CRITICAL
           ignore-unfixed: true
@@ -103,27 +115,32 @@ jobs:
       - name: Scan (report only, high and critical, fixed or not)
         if: always() && steps.tags.outputs.dated != ''
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        env:
+          TRIVY_NON_SSL: "true"
+          TRIVY_IMAGE_SRC: remote
         with:
           version: v0.76.1
-          input: ${{ runner.temp }}/image.tar
+          image-ref: localhost:5000/${{ matrix.image }}:scan
           scanners: vuln
           severity: HIGH,CRITICAL
           exit-code: "0"
 
+      # Copies the scanned image, unchanged, to Docker Hub under both tags.
       - name: Push
         env:
           DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
           DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+          IMAGE: ${{ matrix.image }}
           REPO: ${{ steps.tags.outputs.repo }}
           TAG: ${{ steps.tags.outputs.tag }}
           DATED: ${{ steps.tags.outputs.dated }}
         run: |
           set -euo pipefail
-          docker load -i "$RUNNER_TEMP/image.tar"
-          echo "$DOCKERHUB_TOKEN" | docker login docker.io -u "$DOCKERHUB_USERNAME" --password-stdin
-          docker push "$REPO:$DATED"
-          docker push "$REPO:$TAG"
-          docker logout docker.io
+          for tag in "$DATED" "$TAG"; do
+            skopeo copy --src-tls-verify=false \
+              --dest-username "$DOCKERHUB_USERNAME" --dest-password "$DOCKERHUB_TOKEN" \
+              "docker://localhost:5000/$IMAGE:scan" "docker://$REPO:$tag"
+          done
 
   notify:
     needs: build
